@@ -1,0 +1,12 @@
+{
+  "name": "slack2json",
+  "version": "0.1.0",
+  "description": "Dump a Slack channel or thread (private and Slack Connect too) to Markdown or JSONL using a logged-in Chrome profile via headless Playwright",
+  "type": "module",
+  "bin": { "slack2json": "bin/slack2json.ts" },
+  "engines": { "node": ">=22.18" },
+  "scripts": { "test": "node --test test/*.test.ts", "typecheck": "tsc" },
+  "dependencies": { "playwright-core": "^1.64.1" },
+  "devDependencies": { "@types/node": "^26.6.5", "typescript": "^7.0.2" },
+  "license": "MIT"
+}
