@@ -8,7 +8,7 @@ export interface Session { token: string; cookieHeader: string; }
 // Boots the Slack web client in a throwaway copy of the Chrome profile and reads the
 // workspace's xoxc token from localStorage plus the `d` session cookie.
 export async function openSession(root: string, profile: Profile, workspace: string, opt: { channel: string; headed: boolean; timeoutMs: number; log: (m: string) => void }): Promise<Session> {
-  const tmp = cloneProfile(root, profile.dir);
+  const tmp = cloneProfile(root, profile.dir, ['slack.com']);
   let ctx: BrowserContext | undefined;
   try {
     opt.log(`Launching ${opt.channel}${opt.headed ? '' : ' (headless)'}`);
