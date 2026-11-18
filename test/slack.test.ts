@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -62,15 +62,25 @@ test('attachmentName: keeps unicode, replaces path-unsafe characters', () => {
   assert.equal(attachmentName('1.2', { id: 'F2', name: 'a/b:c?.txt' }), '12-F2-a_b_c_.txt');
 });
 
-test('attachmentName: a long title stays under the filesystem limit and keeps its extension', () => {
-  const atLimit = attachmentName('1.2', { id: 'F1', name: 'b'.repeat(96) + '.png' });
+test('attachmentName: a long title stays under the byte limit and keeps its extension', () => {
+  const short = attachmentName('1.2', { id: 'F1', name: 'b'.repeat(96) + '.png' });
   const pastLimit = attachmentName('1.2', { id: 'F2', name: 'a'.repeat(230) + '.png' });
-  assert.equal(atLimit.length, 106);
-  assert.equal(pastLimit.length, 106);
-  assert.ok(pastLimit.endsWith('.png'));
+  const cjk = attachmentName('1.2', { id: 'F3', name: '截圖'.repeat(60) + '.png' });
+  const even = attachmentName('1.2', { id: 'F4', name: 'é'.repeat(100) + '.png' });
+  assert.equal(short, '12-F1-' + 'b'.repeat(86) + '.png');
+  assert.equal(pastLimit, '12-F2-' + 'a'.repeat(86) + '.png');
+  assert.equal(even, '12-F4-' + 'é'.repeat(43) + '.png');
+  assert.ok(cjk.endsWith('.png'));
+  assert.ok(!cjk.includes('\uFFFD'), 'a character cut in half would show as U+FFFD');
+  for (const n of [short, pastLimit, cjk, even]) assert.ok(Buffer.byteLength(n) <= 255);
   const dir = mkdtempSync(join(tmpdir(), 'slack2json-name-'));
-  try { writeFileSync(join(dir, pastLimit), 'x'); assert.ok(readFileSync(join(dir, pastLimit), 'utf8') === 'x'); }
-  finally { rmSync(dir, { recursive: true, force: true }); }
+  try {
+    for (const n of [short, pastLimit, cjk, even]) { writeFileSync(join(dir, n), 'x'); assert.equal(readFileSync(join(dir, n), 'utf8'), 'x'); }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('attachmentName: an extension longer than the kept part does not leak into the name', () => {
+  assert.equal(attachmentName('1.2', { id: 'F', name: 'x.abcdefghijklmno' }), '12-F-x.abcdefghi');
 });
 
 test('saveFiles: downloads allowlisted hosts only and records the local path', async () => {
@@ -129,15 +139,35 @@ test('saveFiles: one failed download sets no path, reports it, and the next file
   globalThis.fetch = (async (u: URL | string) =>
     String(u).includes('a.csv') ? new Response('nope', { status: 500 }) : new Response(new Uint8Array([7]))) as typeof fetch;
   try {
-    const d: Dump = { ...dump, replies: {}, roots: [{ ts: '1792152594.288759', files: [
+    const d: Dump = { ...dump, roots: [{ ts: '1792152594.288759', files: [
       { id: 'F1', name: 'a.csv', url_private: 'https://files.slack.com/files-pri/T1-F1/a.csv' },
       { id: 'F2', name: 'b.png', url_private: 'https://files.slack.com/files-pri/T1-F2/b.png' },
-    ] }] };
+    ] }], replies: { '1792152594.288759': [{ ts: '1792152600.000100', files: [
+      { id: 'F1', name: 'a.csv', url_private: 'https://files.slack.com/files-pri/T1-F1/a.csv' },
+    ] }] } };
     const failed = await saveFiles(d, dir, 'd=1', (m) => logs.push(m));
     assert.equal(failed, 1);
     assert.equal(d.roots[0].files![0].path, undefined);
+    assert.equal(d.replies['1792152594.288759'][0].files![0].path, undefined);
     assert.equal(d.roots[0].files![1].path, join(dir, '1792152594288759-F2-b.png'));
-    assert.deepEqual(logs.filter((m) => m.startsWith('Download failed')), ['Download failed (500) for a.csv']);
+    assert.deepEqual(logs.filter((m) => m.startsWith('Download failed')), ['Download failed (500) for a.csv', 'Download failed (500) for a.csv']);
+  } finally { globalThis.fetch = origin; rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('saveFiles: a write that fails is counted like a failed download', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'slack2json-files-'));
+  const origin = globalThis.fetch;
+  const logs: string[] = [];
+  globalThis.fetch = (async () => new Response(new Uint8Array([1]))) as typeof fetch;
+  try {
+    const f = { id: 'F1', name: 'a.csv', url_private: 'https://files.slack.com/files-pri/T1-F1/a.csv' };
+    mkdirSync(join(dir, attachmentName('1792152594.288759', f)));   // a directory in the way makes writeFileSync fail
+    const d: Dump = { ...dump, replies: {}, roots: [{ ts: '1792152594.288759', files: [f] }] };
+    const failed = await saveFiles(d, dir, 'd=1', (m) => logs.push(m));
+    assert.equal(failed, 1);
+    assert.equal(d.roots[0].files![0].path, undefined);
+    assert.match(logs.join('\n'), /Write failed \(EISDIR\) for a\.csv/);
+    assert.equal(existsSync(join(dir, attachmentName('1792152594.288759', f) + '.part')), false);
   } finally { globalThis.fetch = origin; rmSync(dir, { recursive: true, force: true }); }
 });
 

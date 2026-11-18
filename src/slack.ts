@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join, extname } from 'node:path';
 import { CliError } from './errors.ts';
 
@@ -164,19 +164,31 @@ export function renderMarkdown(d: Dump, tz?: string): string {
   return lines.join('\n');
 }
 
-// Capped at the length macOS (255 UTF-16 units) and Windows accept: a long Slack title would
-// otherwise make writeFileSync throw ENAMETOOLONG and lose the whole dump.
+// Slack titles can be long or CJK, and ext4, exFAT and SMB cap a file name at 255 bytes, so the name
+// is bounded in bytes. 90 leaves room for the ts-id prefix, and an over-long name makes writeFileSync
+// throw ENAMETOOLONG, which would lose the whole dump.
+const NAME_BYTES = 90;
+
+function cutBytes(s: string, max: number): string {
+  const buf = Buffer.from(s);
+  if (buf.length <= max) return s;
+  let end = max;
+  while (end > 0 && ((buf[end] ?? 0) & 0xc0) === 0x80) end--;   // never split a multi-byte character
+  return buf.subarray(0, end).toString('utf8');
+}
+
 export function attachmentName(ts: string, f: MsgFile): string {
   const full = (f.title || f.name || 'file').replace(/[/\\:*?"<>|\x00-\x1f]+/g, '_');
-  const ext = extname(full).slice(0, 10);
-  const base = ext ? full.slice(0, -ext.length) : full;
-  return `${ts.replace('.', '')}-${f.id ?? 'file'}-${base.slice(0, 100 - ext.length)}${ext}`;
+  const raw = extname(full);
+  const ext = raw.slice(0, 10);
+  const base = raw ? full.slice(0, -raw.length) : full;
+  return `${ts.replace('.', '')}-${f.id ?? 'file'}-${cutBytes(base, NAME_BYTES - Buffer.byteLength(ext))}${ext}`;
 }
 
 const FILE_HOSTS = ['files.slack.com'];
 
-// The session cookie and xoxc token must only travel to Slack's own file CDN: url_private comes from
-// an API response, so a host outside the allowlist would hand the session to whoever put it there.
+// The session cookie must only travel to Slack's own file CDN: url_private comes from an API response,
+// so a host outside the allowlist would hand the session to whoever put it there.
 function slackFileUrl(u: string | undefined): string | null {
   if (!u) return null;
   let url: URL;
@@ -186,25 +198,31 @@ function slackFileUrl(u: string | undefined): string | null {
 
 // Attachments sit behind the same session as the API: their permalink opens a login page and
 // url_private only accepts the `d` cookie, so a dump without the bytes is unusable later.
-// Returns how many files could not be downloaded, so the CLI can fail loudly.
+// Returns how many distinct files could not be saved, so the CLI can fail loudly.
 export async function saveFiles(d: Dump, dir: string, cookieHeader: string, log: (m: string) => void): Promise<number> {
   const done = new Map<string, string>();
-  let failed = 0;
+  const failures = new Set<string>();
+  const fail = (m: string, f: MsgFile) => { failures.add(f.id ?? f.url_private ?? f.name ?? 'file'); log(m); };
   mkdirSync(dir, { recursive: true });
   for (const m of [...d.roots, ...Object.values(d.replies).flat()]) for (const f of m.files ?? []) {
     const src = slackFileUrl(f.url_private);
-    if (!src) { log(`No download url for ${f.name ?? 'file'}`); failed++; continue; }
+    const name = f.name ?? 'file';
+    if (!src) { fail(`No download url for ${name}`, f); continue; }
     const known = f.id ? done.get(f.id) : undefined;
     if (known) { f.path = known; continue; }
     const r = await fetch(src, { headers: { Cookie: cookieHeader } });
-    if (!r.ok) { log(`Download failed (${r.status}) for ${f.name ?? 'file'}`); failed++; continue; }
+    if (!r.ok) { fail(`Download failed (${r.status}) for ${name}`, f); continue; }
     const dest = join(dir, attachmentName(m.ts, f));
-    writeFileSync(dest, Buffer.from(await r.arrayBuffer()));
+    const part = `${dest}.part`;
+    // Bytes land in a .part file first: a write that dies halfway never leaves a truncated file
+    // under the real name, and the rename is atomic.
+    try { writeFileSync(part, Buffer.from(await r.arrayBuffer())); renameSync(part, dest); }
+    catch (e) { rmSync(part, { force: true }); fail(`Write failed (${(e as NodeJS.ErrnoException).code ?? (e as Error).message}) for ${name}`, f); continue; }
     if (f.id) done.set(f.id, dest);
     f.path = dest;
   }
   log(`${done.size} files in ${dir}`);
-  return failed;
+  return failures.size;
 }
 
 export function renderJsonl(d: Dump): string {
