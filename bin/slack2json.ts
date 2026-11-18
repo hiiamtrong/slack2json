@@ -5,7 +5,7 @@ import { parseArgs } from 'node:util';
 import { defaultChromeRoot, listProfiles, resolveProfile } from '../src/chrome.ts';
 import { CliError } from '../src/errors.ts';
 import { openSession } from '../src/session.ts';
-import { fetchDump, makeApi, parseSince, parseTarget, renderJsonl, renderMarkdown } from '../src/slack.ts';
+import { fetchDump, makeApi, parseSince, parseTarget, renderJsonl, renderMarkdown, saveFiles } from '../src/slack.ts';
 
 const VERSION = '0.1.0';
 const HELP = `slack2json: dump a Slack channel or thread to JSONL (or Markdown) using a logged-in Chrome profile (headless Playwright)
@@ -24,6 +24,7 @@ OPTIONS
       --no-threads         Channel mode only: skip fetching replies.
   -w, --workspace <sub>    Workspace subdomain, needed only with a bare channel id.
   -o, --out <file>         Write to this file and print its path instead of the content.
+      --files <dir>        Download attachments into this dir and record their local path.
       --md                 Markdown instead of JSONL: one heading per message, replies quoted under it.
       --tz <zone>          Time zone for --md timestamps (default: this machine's). JSONL times are UTC ISO.
       --channel <c>        Browser channel: chrome (default), msedge, chromium
@@ -53,7 +54,7 @@ async function run(): Promise<number> {
     options: {
       profile: { type: 'string', short: 'p' }, since: { type: 'string', short: 's' }, 'no-threads': { type: 'boolean', default: false },
       workspace: { type: 'string', short: 'w' }, out: { type: 'string', short: 'o' }, json: { type: 'boolean', default: false }, md: { type: 'boolean', default: false },
-      tz: { type: 'string' }, channel: { type: 'string', default: 'chrome' }, headed: { type: 'boolean', default: false },
+      files: { type: 'string' }, tz: { type: 'string' }, channel: { type: 'string', default: 'chrome' }, headed: { type: 'boolean', default: false },
       timeout: { type: 'string', default: '90' }, progress: { type: 'boolean', default: false },
       help: { type: 'boolean', short: 'h', default: false }, version: { type: 'boolean', short: 'v', default: false },
     },
@@ -79,10 +80,13 @@ async function run(): Promise<number> {
   const session = await openSession(root, profile, target.workspace, { channel: opt.channel!, headed: opt.headed!, timeoutMs: Number(opt.timeout) * 1000, log });
   const api = makeApi(target.workspace, session.token, session.cookieHeader);
   const dump = await fetchDump(api, target, since, { threads: !opt['no-threads'], log });
+  const failed = opt.files ? await saveFiles(dump, resolve(opt.files), session.cookieHeader, log) : 0;
   const body = opt.md ? renderMarkdown(dump, opt.tz) : renderJsonl(dump);
   if (opt.out) { const f = resolve(opt.out); writeFileSync(f, body); console.log(f); }
   else process.stdout.write(body);
   log('Done');
+  // The dump is written first: a file it could not fetch is a warning, not a reason to lose the rest.
+  if (failed) return fail(new CliError('FILE_ERROR', `${failed} attachment(s) could not be downloaded`, 'Re-run with --progress to see which ones', 5));
   return 0;
 }
 

@@ -1,3 +1,5 @@
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { join, extname } from 'node:path';
 import { CliError } from './errors.ts';
 
 export interface Target {
@@ -31,10 +33,14 @@ export function parseSince(v: string | undefined, now = Date.now()): number {
   return t / 1000;
 }
 
+export interface MsgFile {
+  id?: string; name?: string; title?: string; permalink?: string; url_private?: string; path?: string;
+}
+
 export interface Message {
   ts: string; thread_ts?: string; user?: string; username?: string; bot_profile?: { name?: string };
   text?: string; subtype?: string; reply_count?: number; edited?: unknown;
-  files?: { name?: string; title?: string; permalink?: string }[];
+  files?: MsgFile[];
   reactions?: { name: string; count: number }[];
 }
 
@@ -134,7 +140,11 @@ export function fmtTime(ts: string | number, tz?: string): string {
 
 function extras(m: Message, indent: string): string[] {
   const out: string[] = [];
-  for (const f of m.files ?? []) out.push(`${indent}[file] ${f.title || f.name || 'file'}${f.permalink ? ' ' + f.permalink : ''}`);
+  for (const f of m.files ?? []) {
+    const label = f.title || f.name || 'file';
+    const where = f.path ?? f.permalink;
+    out.push(`${indent}[file] ${label}${where ? ' ' + where : ''}`);
+  }
   if (m.reactions?.length) out.push(`${indent}[reactions: ${m.reactions.map((r) => `:${r.name}:x${r.count}`).join(' ')}]`);
   return out;
 }
@@ -154,11 +164,54 @@ export function renderMarkdown(d: Dump, tz?: string): string {
   return lines.join('\n');
 }
 
+// Capped at the length macOS (255 UTF-16 units) and Windows accept: a long Slack title would
+// otherwise make writeFileSync throw ENAMETOOLONG and lose the whole dump.
+export function attachmentName(ts: string, f: MsgFile): string {
+  const full = (f.title || f.name || 'file').replace(/[/\\:*?"<>|\x00-\x1f]+/g, '_');
+  const ext = extname(full).slice(0, 10);
+  const base = ext ? full.slice(0, -ext.length) : full;
+  return `${ts.replace('.', '')}-${f.id ?? 'file'}-${base.slice(0, 100 - ext.length)}${ext}`;
+}
+
+const FILE_HOSTS = ['files.slack.com'];
+
+// The session cookie and xoxc token must only travel to Slack's own file CDN: url_private comes from
+// an API response, so a host outside the allowlist would hand the session to whoever put it there.
+function slackFileUrl(u: string | undefined): string | null {
+  if (!u) return null;
+  let url: URL;
+  try { url = new URL(u); } catch { return null; }
+  return FILE_HOSTS.includes(url.hostname) ? `https://${url.hostname}${url.pathname}${url.search}` : null;
+}
+
+// Attachments sit behind the same session as the API: their permalink opens a login page and
+// url_private only accepts the `d` cookie, so a dump without the bytes is unusable later.
+// Returns how many files could not be downloaded, so the CLI can fail loudly.
+export async function saveFiles(d: Dump, dir: string, cookieHeader: string, log: (m: string) => void): Promise<number> {
+  const done = new Map<string, string>();
+  let failed = 0;
+  mkdirSync(dir, { recursive: true });
+  for (const m of [...d.roots, ...Object.values(d.replies).flat()]) for (const f of m.files ?? []) {
+    const src = slackFileUrl(f.url_private);
+    if (!src) { log(`No download url for ${f.name ?? 'file'}`); failed++; continue; }
+    const known = f.id ? done.get(f.id) : undefined;
+    if (known) { f.path = known; continue; }
+    const r = await fetch(src, { headers: { Cookie: cookieHeader } });
+    if (!r.ok) { log(`Download failed (${r.status}) for ${f.name ?? 'file'}`); failed++; continue; }
+    const dest = join(dir, attachmentName(m.ts, f));
+    writeFileSync(dest, Buffer.from(await r.arrayBuffer()));
+    if (f.id) done.set(f.id, dest);
+    f.path = dest;
+  }
+  log(`${done.size} files in ${dir}`);
+  return failed;
+}
+
 export function renderJsonl(d: Dump): string {
   const row = (m: Message, thread_ts: string | null) => JSON.stringify({
     ts: m.ts, time: new Date(Number(m.ts) * 1000).toISOString(), thread_ts, channel: d.channel, channel_name: d.channelName,
     user: m.user ?? null, author: author(m, d.users), text: cleanText(m.text, d.users), raw_text: m.text ?? '',
-    files: (m.files ?? []).map((f) => ({ name: f.title || f.name, url: f.permalink })), reactions: m.reactions ?? [],
+    files: (m.files ?? []).map((f) => ({ name: f.title || f.name, url: f.permalink, path: f.path })), reactions: m.reactions ?? [],
     permalink: permalink(d, m.ts, thread_ts ?? undefined),
   });
   const out: string[] = [];

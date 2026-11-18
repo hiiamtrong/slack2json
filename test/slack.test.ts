@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
-import { cleanText, parseSince, parseTarget, permalink, renderJsonl, renderMarkdown, type Dump } from '../src/slack.ts';
+import { attachmentName, cleanText, fetchDump, parseSince, parseTarget, permalink, renderJsonl, renderMarkdown, saveFiles, type Api, type Dump } from '../src/slack.ts';
+import { CliError } from '../src/errors.ts';
 
 test('parseTarget: channel, message, thread reply, bare id', () => {
   assert.deepEqual(parseTarget('https://acme.slack.com/archives/C0BD0UXQL1L'), { workspace: 'acme', channel: 'C0BD0UXQL1L', thread: null });
@@ -51,4 +55,114 @@ test('renderJsonl: one line per message, replies carry thread_ts', () => {
   assert.equal(rows.length, 2);
   assert.equal(rows[0].thread_ts, null); assert.equal(rows[0].author, 'Ann'); assert.equal(rows[0].text, 'root @Bob');
   assert.equal(rows[1].thread_ts, '1792152594.288759'); assert.equal(rows[1].files.length, 0); assert.equal(rows[1].reactions[0].count, 2);
+});
+
+test('attachmentName: keeps unicode, replaces path-unsafe characters', () => {
+  assert.equal(attachmentName('1794975623.411099', { id: 'F1', name: '截圖 2026-11-18 中午12.19.13.png' }), '1794975623411099-F1-截圖 2026-11-18 中午12.19.13.png');
+  assert.equal(attachmentName('1.2', { id: 'F2', name: 'a/b:c?.txt' }), '12-F2-a_b_c_.txt');
+});
+
+test('attachmentName: a long title stays under the filesystem limit and keeps its extension', () => {
+  const atLimit = attachmentName('1.2', { id: 'F1', name: 'b'.repeat(96) + '.png' });
+  const pastLimit = attachmentName('1.2', { id: 'F2', name: 'a'.repeat(230) + '.png' });
+  assert.equal(atLimit.length, 106);
+  assert.equal(pastLimit.length, 106);
+  assert.ok(pastLimit.endsWith('.png'));
+  const dir = mkdtempSync(join(tmpdir(), 'slack2json-name-'));
+  try { writeFileSync(join(dir, pastLimit), 'x'); assert.ok(readFileSync(join(dir, pastLimit), 'utf8') === 'x'); }
+  finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('saveFiles: downloads allowlisted hosts only and records the local path', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'slack2json-files-'));
+  const origin = globalThis.fetch; const fetched: string[] = [];
+  globalThis.fetch = (async (u: URL | string) => { fetched.push(String(u)); return new Response(new Uint8Array([1, 2, 3])); }) as typeof fetch;
+  try {
+    const d: Dump = {
+      ...dump, replies: {},
+      roots: [{ ts: '1792152594.288759', user: 'U1', files: [
+        { id: 'F1', name: 'a.csv', permalink: 'https://acme.slack.com/files/F1', url_private: 'https://files.slack.com/files-pri/T1-F1/a.csv?x=1' },
+        { id: 'F2', name: 'evil', url_private: 'https://evil.example.com/x' },
+      ] }],
+    };
+    const logs: string[] = [];
+    const failed = await saveFiles(d, dir, 'd=1', (m) => logs.push(m));
+    assert.deepEqual(fetched, ['https://files.slack.com/files-pri/T1-F1/a.csv?x=1']);
+    const saved = d.roots[0].files![0].path!;
+    assert.equal(saved, join(dir, '1792152594288759-F1-a.csv'));
+    assert.deepEqual([...readFileSync(saved)], [1, 2, 3]);
+    assert.equal(d.roots[0].files![1].path, undefined);
+    assert.equal(failed, 1);
+    assert.match(logs.join('\n'), /No download url for evil/);
+    const row = JSON.parse(renderJsonl(d).trim());
+    assert.equal(row.files[0].path, saved); assert.equal(row.files[0].url, 'https://acme.slack.com/files/F1');
+    assert.match(renderMarkdown(d, 'UTC'), /\[file\] a\.csv \/.*-F1-a\.csv/);
+  } finally { globalThis.fetch = origin; rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('fetchDump: NO_ACCESS when the channel is unreadable, API_ERROR for anything else', async () => {
+  const noAccess = (e: unknown) => e instanceof CliError && e.code === 'NO_ACCESS' && e.exit === 4;
+  const target = { workspace: 'acme', channel: 'C1', thread: null };
+  const infoFail: Api = async () => ({ ok: false, error: 'channel_not_found' });
+  await assert.rejects(fetchDump(infoFail, target, 0, { threads: false, log: () => {} }), noAccess);
+
+  const infoOk = { ok: true, channel: { name: 'proj' } };
+  const threadFail: Api = async (m) => (m === 'conversations.info' ? infoOk : { ok: false, error: 'thread_not_found' });
+  await assert.rejects(fetchDump(threadFail, { ...target, thread: '1.1' }, 0, { threads: false, log: () => {} }), noAccess);
+
+  const otherFail: Api = async (m) => (m === 'conversations.info' ? infoOk : { ok: false, error: 'invalid_auth' });
+  await assert.rejects(fetchDump(otherFail, target, 0, { threads: false, log: () => {} }),
+    (e: unknown) => e instanceof CliError && e.code === 'API_ERROR' && e.exit === 5);
+});
+
+test('renderers: an empty dump is still valid output', () => {
+  const empty: Dump = { workspace: 'acme', channel: 'C1', channelName: 'proj', since: 0, roots: [], replies: {}, users: {} };
+  assert.equal(renderJsonl(empty), '\n');
+  assert.match(renderMarkdown(empty, 'UTC'), /0 messages, 0 replies/);
+  assert.equal(attachmentName('1.2', {}), '12-file-file');
+});
+
+test('saveFiles: one failed download sets no path, reports it, and the next file still lands', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'slack2json-files-'));
+  const origin = globalThis.fetch;
+  const logs: string[] = [];
+  globalThis.fetch = (async (u: URL | string) =>
+    String(u).includes('a.csv') ? new Response('nope', { status: 500 }) : new Response(new Uint8Array([7]))) as typeof fetch;
+  try {
+    const d: Dump = { ...dump, replies: {}, roots: [{ ts: '1792152594.288759', files: [
+      { id: 'F1', name: 'a.csv', url_private: 'https://files.slack.com/files-pri/T1-F1/a.csv' },
+      { id: 'F2', name: 'b.png', url_private: 'https://files.slack.com/files-pri/T1-F2/b.png' },
+    ] }] };
+    const failed = await saveFiles(d, dir, 'd=1', (m) => logs.push(m));
+    assert.equal(failed, 1);
+    assert.equal(d.roots[0].files![0].path, undefined);
+    assert.equal(d.roots[0].files![1].path, join(dir, '1792152594288759-F2-b.png'));
+    assert.deepEqual(logs.filter((m) => m.startsWith('Download failed')), ['Download failed (500) for a.csv']);
+  } finally { globalThis.fetch = origin; rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('saveFiles: the repeated file of a thread is downloaded once and shared', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'slack2json-files-'));
+  const origin = globalThis.fetch;
+  const fetched: string[] = [];
+  globalThis.fetch = (async (u: URL | string) => { fetched.push(String(u)); return new Response(new Uint8Array([7])); }) as typeof fetch;
+  try {
+    const file = { id: 'F9', name: 'shot.png', url_private: 'https://files.slack.com/files-pri/T1-F9/shot.png' };
+    const d: Dump = { ...dump, roots: [{ ts: '1792152594.288759', files: [{ ...file }] }], replies: { '1792152594.288759': [{ ts: '1792152600.000100', files: [{ ...file }] }] } };
+    await saveFiles(d, dir, 'd=1', () => {});
+    assert.equal(fetched.length, 1);
+    assert.equal(d.roots[0].files![0].path, join(dir, '1792152594288759-F9-shot.png'));
+    assert.equal(d.replies['1792152594.288759'][0].files![0].path, d.roots[0].files![0].path);
+  } finally { globalThis.fetch = origin; rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('saveFiles: a rejected request propagates instead of writing a half dump', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'slack2json-files-'));
+  const origin = globalThis.fetch;
+  globalThis.fetch = (async () => { throw new Error('ECONNRESET'); }) as typeof fetch;
+  try {
+    const d: Dump = { ...dump, replies: {}, roots: [{ ts: '1792152594.288759', files: [{ id: 'F1', name: 'a.csv', url_private: 'https://files.slack.com/files-pri/T1-F1/a.csv' }] }] };
+    await assert.rejects(saveFiles(d, dir, 'd=1', () => {}), /ECONNRESET/);
+    assert.equal(d.roots[0].files![0].path, undefined);
+  } finally { globalThis.fetch = origin; rmSync(dir, { recursive: true, force: true }); }
 });
